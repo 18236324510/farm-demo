@@ -1,107 +1,191 @@
 <!DOCTYPE html>
 <!--
-设计说明 / DESIGN NOTES (for porting to Godot/Unity/etc.)
-- State (pure data, JSON-serializable, saved to localStorage key "farmDemoSave"):
-  state = {day, time(minutes from 6:00), gold, energy, player{x,y,dir}, tool, inv{itemId:count}, bin{itemId:count},
-           tiles[y][x] = {t:'grass'|'soil'|'water'|'house'|'bin'|'path', watered, crop:{id, stage}|null}}
-- Data tables: CROPS (seed price, sell price, stages, color), TOOLS (toolbar order).
-- Systems (functions, engine-agnostic logic): move(), interact(tx,ty) dispatches by tool,
-  endDay() (ship bin -> gold, grow watered crops +1 stage, reset water, restore energy), save()/load().
-- Rendering: drawTile/drawCrop/drawPlayer/drawHUD are procedural canvas draws; replace with sprites in port.
-- Loop: requestAnimationFrame -> update(dt) (input, clock) -> render(). Clock: 1 real sec = 10 game min; at 2:00 forced sleep.
+设计说明 / DESIGN NOTES v2 (for porting to Godot/Unity/etc.)
+- State (pure JSON, localStorage key "farmDemoSave", state.v = save version; migrate() upgrades v1 saves):
+  {v, day, time(min since 6:00), gold, energy, player{x,y,dir}, tool, sel(selected backpack item),
+   inv{item:n}, bin{item:n}, tiles[y][x]={t,watered,crop{id,stage}|null},
+   animals[{type:'chicken'|'cow', name, x,y (float, inside pen), happy 0-100, fed, petted, product}],
+   rel{villagerId:{pts 0-2500, talked, gifted}}}
+- Data tables: ITEMS (name, sell price), CROPS, TOOLS, ANIMALS (price, product), VILLAGERS (name, colors,
+  schedule waypoints, loved/liked/disliked, dialogue by heart tier).
+- Systems: move(), interact(tx,ty) (priority: villager > animal > building > tool), gift(), shop menu,
+  endDay() (ship bin, crop growth, animal happiness/products, reset daily flags), save()/load()/migrate().
+- Map 32x20 tiles, camera follows player in 20x14 viewport. Farm left, coop+pen top-middle, village path right.
+- Rendering is procedural canvas drawing; swap for sprites in a port. UI modes: null | 'shop' | 'talk' | 'rel'.
+- All characters, names, dialogue and art are original.
 -->
-<html lang="zh"><head><meta charset="utf-8"><title>小小农场 Demo</title>
-<style>body{margin:0;background:#222;color:#eee;font-family:sans-serif;display:flex;flex-direction:column;align-items:center}canvas{image-rendering:pixelated;border:2px solid #000;margin-top:8px}#help{font-size:13px;margin:6px;opacity:.8}</style></head>
+<html lang="zh"><head><meta charset="utf-8"><title>小小农场 Demo v2</title>
+<style>body{margin:0;background:#222;color:#eee;font-family:sans-serif;display:flex;flex-direction:column;align-items:center}canvas{border:2px solid #000;margin-top:8px}#help{font-size:13px;margin:6px;opacity:.8;max-width:660px}</style></head>
 <body><canvas id="c" width="640" height="512"></canvas>
-<div id="help">WASD/方向键移动 · 1-6选工具 · 空格/点击 使用 · 在出货箱旁按空格(手)放入作物 · 进屋门口或按N睡觉 · R重置存档</div>
+<div id="help">WASD/方向键移动 · 1-7选工具 · 空格/点击 使用/对话/抚摸/收集 · Q切换背包物品 · G送礼 · H人际关系 · 镰刀割草得干草 · 拿干草对鸡舍喂食 · 动物商店买动物和干草 · N睡觉 · R重置</div>
 <script>
-const T=32,W=20,H=14,cv=document.getElementById('c'),g=cv.getContext('2d');
-const CROPS={parsnip:{name:'防风草',seed:20,sell:35,stages:4,color:'#f2e6b0'},
- potato:{name:'土豆',seed:50,sell:80,stages:5,color:'#c49a5a'},
- berry:{name:'草莓',seed:100,sell:180,stages:6,color:'#e33'}};
-const TOOLS=[{id:'hand',name:'手'},{id:'hoe',name:'锄头'},{id:'can',name:'水壶'},
- {id:'seed',crop:'parsnip',name:'防风草种子'},{id:'seed',crop:'potato',name:'土豆种子'},{id:'seed',crop:'berry',name:'草莓种子'}];
-let state,msg='',msgT=0;
-function newState(){const tiles=[];for(let y=0;y<H;y++){tiles.push([]);for(let x=0;x<W;x++){let t='grass';
+const T=32,W=32,H=20,VW=20,VH=14,cv=document.getElementById('c'),g=cv.getContext('2d');
+const ITEMS={parsnip:{name:'防风草',sell:35},potato:{name:'土豆',sell:80},berry:{name:'草莓',sell:180},
+ egg:{name:'鸡蛋',sell:50},milk:{name:'牛奶',sell:125},hay:{name:'干草',sell:0}};
+const CROPS={parsnip:{seed:20,stages:4,color:'#f2e6b0'},potato:{seed:50,stages:5,color:'#c49a5a'},berry:{seed:100,stages:6,color:'#e33'}};
+const TOOLS=[{id:'hand',name:'手'},{id:'hoe',name:'锄头'},{id:'can',name:'水壶'},{id:'scythe',name:'镰刀'},
+ {id:'seed',crop:'parsnip',name:'防风籽'},{id:'seed',crop:'potato',name:'土豆籽'},{id:'seed',crop:'berry',name:'草莓籽'}];
+const ANIMALS={chicken:{name:'鸡',price:300,product:'egg'},cow:{name:'奶牛',price:800,product:'milk'}};
+const PEN={x0:8,y0:5,x1:14,y1:9};
+const VILLAGERS=[
+ {id:'yu',name:'林小雨',body:'#d26fa8',hair:'#2b1b12',path:[[23,4],[28,4]],loved:['berry'],liked:['egg','parsnip'],disliked:['hay'],
+  lines:[['你好，我在画这条小路的晨光。','新来的农夫？欢迎来到青禾村。'],['你的田今天看起来很精神！','我想画一幅你的农场，可以吗？'],['和你聊天总能让我有新的灵感。','这幅画……是送给你的，别笑我啊。']]},
+ {id:'zhou',name:'老周',body:'#6b6b7a',hair:'#999',path:[[29,8],[29,8]],loved:['milk'],liked:['potato'],disliked:['berry'],
+  lines:[['嗯。铁匠铺不招学徒。','锄头钝了就别硬用。'],['你干活挺踏实，我看得出来。','年轻时我也种过地，手上的茧都一样。'],['有空来铺子坐坐，给你泡壶茶。','你就像我自家孩子一样，别太累着。']]},
+ {id:'he',name:'阿禾',body:'#3a9a5a',hair:'#5a3311',path:[[22,13],[30,13]],loved:['egg'],liked:['berry','milk'],disliked:['potato'],
+  lines:[['我在找会发光的石头，你见过吗？','嘿！你跑得没我快！'],['今天我在池塘边看见一只青蛙！','你养的鸡会不会认得你呀？'],['你是我最好的大朋友！','长大了我也要当农夫，跟你一样。']]},
+ {id:'su',name:'苏婆婆',body:'#8a5aa8',hair:'#eee',path:[[25,16],[27,16]],loved:['parsnip'],liked:['egg','milk','potato'],disliked:[],
+  lines:[['哎呀，小心脚下的石板。','天凉了，记得多穿点。'],['你种的菜让我想起老伴的菜园。','今天的风里有麦子的味道。'],['有你在，村子热闹多了。','来，婆婆给你留了块桂花糕。']]}];
+let state,msg='',msgT=0,mode=null,talk=null;
+function genTiles(){const tiles=[];for(let y=0;y<H;y++){tiles.push([]);for(let x=0;x<W;x++){let t='grass';
  if(x>=15&&y>=9&&x<19&&y<13)t='water';if(x>=1&&x<5&&y>=1&&y<4)t='house';if(x==6&&y==3)t='bin';
- tiles[y].push({t,watered:false,crop:null});}}
- return{day:1,time:0,gold:200,energy:100,player:{x:3,y:5,dir:'down'},tool:0,inv:{},bin:{},tiles};}
+ if(x>=9&&x<13&&y>=1&&y<4)t='coop';if(x==14&&y==3)t='shop';
+ if((x==PEN.x0-1||x==PEN.x1+1)&&y>=PEN.y0-1&&y<=PEN.y1+1||(y==PEN.y1+1)&&x>=PEN.x0-1&&x<=PEN.x1+1)t='fence';
+ if(y==PEN.y0-1&&x>=PEN.x0-1&&x<=PEN.x1+1&&t!='coop')t=(x==PEN.x0-1||x==PEN.x1+1)?'fence':t;
+ if(x==20&&y!=10)t='fence';if(x>=21&&(y==4||y==13||y==16||x==26||x==29&&y>=4&&y<=8))t='path';if(y==10&&x>=19)t='path';
+ if(x>=22&&x<25&&y>=1&&y<4||x>=27&&x<31&&y>=1&&y<4||x>=27&&x<30&&y>=17&&y<20)t='vhouse';
+ tiles[y].push({t,watered:false,crop:null});}}return tiles;}
+function newRel(){const r={};VILLAGERS.forEach(v=>r[v.id]={pts:0,talked:false,gifted:false});return r;}
+function newState(){return{v:2,day:1,time:0,gold:500,energy:100,player:{x:3,y:5,dir:'down'},tool:0,sel:null,inv:{},bin:{},tiles:genTiles(),animals:[],rel:newRel()};}
+function migrate(s){if(s.v==2)return s;const tiles=genTiles();
+ s.tiles.forEach((row,y)=>row.forEach((t,x)=>{if(y<H&&x<W&&tiles[y][x].t=='grass'&&(t.t=='soil'))tiles[y][x]=t;}));
+ s.tiles=tiles;s.v=2;s.animals=[];s.rel=newRel();s.sel=null;if(s.tool>6)s.tool=0;return s;}
 function save(){localStorage.setItem('farmDemoSave',JSON.stringify(state));}
-function load(){try{const s=JSON.parse(localStorage.getItem('farmDemoSave'));if(s&&s.tiles)return s;}catch(e){}return null;}
+function load(){try{const s=JSON.parse(localStorage.getItem('farmDemoSave'));if(s&&s.tiles)return migrate(s);}catch(e){}return null;}
 state=load()||newState();
 function say(m){msg=m;msgT=3;}
+function addInv(k,n=1){state.inv[k]=(state.inv[k]||0)+n;if(state.inv[k]<=0)delete state.inv[k];if(!state.sel||!state.inv[state.sel])state.sel=Object.keys(state.inv)[0]||null;}
 const D={up:[0,-1],down:[0,1],left:[-1,0],right:[1,0]};
-function walkable(x,y){if(x<0||y<0||x>=W||y>=H)return false;const t=state.tiles[y][x].t;return t!='water'&&t!='house'&&t!='bin';}
+function villagerPos(v){const [a,b]=v.path,f=(Math.sin(state.time/60*Math.PI/3)+1)/2;return[Math.round(a[0]+(b[0]-a[0])*f),Math.round(a[1]+(b[1]-a[1])*f)];}
+function villagerAt(x,y){return VILLAGERS.find(v=>{const p=villagerPos(v);return p[0]==x&&p[1]==y;});}
+function animalAt(x,y){return state.animals.find(a=>Math.round(a.x)==x&&Math.round(a.y)==y);}
+function walkable(x,y){if(x<0||y<0||x>=W||y>=H)return false;const t=state.tiles[y][x].t;
+ return!['water','house','bin','coop','shop','fence','vhouse'].includes(t)&&!villagerAt(x,y)&&!animalAt(x,y);}
 function move(dir){const p=state.player;p.dir=dir;const[dx,dy]=D[dir];if(walkable(p.x+dx,p.y+dy)){p.x+=dx;p.y+=dy;}}
 function facing(){const p=state.player,[dx,dy]=D[p.dir];return[p.x+dx,p.y+dy];}
 function useEnergy(n){if(state.energy<n){say('太累了，去睡觉吧！');return false;}state.energy-=n;return true;}
+function tier(v){const h=Math.floor(state.rel[v.id].pts/250);return h<3?0:h<7?1:2;}
+function talkTo(v){const r=state.rel[v.id],L=v.lines[tier(v)];if(!r.talked){r.talked=true;r.pts=Math.min(2500,r.pts+20);}
+ talk={name:v.name,text:L[state.day%L.length]};mode='talk';save();}
+function gift(){const [tx,ty]=facing(),v=villagerAt(tx,ty);if(!v){say('面前没有村民');return;}
+ const k=state.sel;if(!k||!state.inv[k]){say('背包里没有选中的物品（Q切换）');return;}
+ const r=state.rel[v.id];if(r.gifted){say(v.name+'今天已经收过礼物了');return;}
+ let d=20,t='谢谢你。';if(v.loved.includes(k)){d=80;t='这是我最爱的！太感谢了！';}else if(v.liked.includes(k)){d=45;t='我很喜欢这个，谢谢！';}else if(v.disliked.includes(k)){d=-20;t='呃……这个我不太需要。';}
+ addInv(k,-1);r.gifted=true;r.pts=Math.max(0,Math.min(2500,r.pts+d));talk={name:v.name,text:t+`（${ITEMS[k].name}，好感${d>0?'+':''}${d}）`};mode='talk';save();}
 function interact(tx,ty){
  if(tx<0||ty<0||tx>=W||ty>=H)return;const tile=state.tiles[ty][tx],tool=TOOLS[state.tool];
+ const v=villagerAt(tx,ty);if(v){talkTo(v);return;}
+ const a=animalAt(tx,ty);if(a){if(a.product){addInv(a.product);say(`收集了${ITEMS[a.product].name}！`);a.product=null;}
+  else if(!a.petted){a.petted=true;a.happy=Math.min(100,a.happy+10);say(`你摸了摸${a.name}，它很开心 ♥`);}else say(`${a.name}心情：${a.happy}`);save();return;}
  if(tile.t=='house'){sleep();return;}
- if(tile.t=='bin'){let n=0;for(const k in state.inv){state.bin[k]=(state.bin[k]||0)+state.inv[k];n+=state.inv[k];}state.inv={};
-  say(n?`放入出货箱 ${n} 件，明早结算`:'没有可出售的作物');save();return;}
+ if(tile.t=='shop'){mode='shop';return;}
+ if(tile.t=='coop'){const hungry=state.animals.filter(a=>!a.fed);if(!state.animals.length){say('鸡舍空空的，去商店买动物吧');return;}
+  if(!hungry.length){say('动物们今天都吃饱了');return;}let n=0;for(const a of hungry){if(!state.inv.hay)break;addInv('hay',-1);a.fed=true;n++;}
+  say(n?`喂了${n}只动物`+(n<hungry.length?'，干草不够了':''):'没有干草！用镰刀割草或去商店买');save();return;}
+ if(tile.t=='bin'){let n=0;for(const k in state.inv){if(k=='hay')continue;state.bin[k]=(state.bin[k]||0)+state.inv[k];n+=state.inv[k];delete state.inv[k];}addInv('x',0);
+  say(n?`放入出货箱 ${n} 件，明早结算`:'没有可出售的物品');save();return;}
  if(tool.id=='hand'){if(tile.crop&&tile.crop.stage>=CROPS[tile.crop.id].stages-1){const id=tile.crop.id;
-   state.inv[id]=(state.inv[id]||0)+1;tile.crop=null;say('收获了 '+CROPS[id].name+'！');save();}
-  else if(tile.crop)say('还没成熟');return;}
+   addInv(id);tile.crop=null;say('收获了 '+ITEMS[id].name+'！');save();}else if(tile.crop)say('还没成熟');return;}
  if(tool.id=='hoe'){if(tile.t=='grass'){if(!useEnergy(2))return;tile.t='soil';say('锄好了地');}return;}
- if(tool.id=='can'){if(tile.t=='water'){say('水壶已灌满');return;}
-  if(tile.t=='soil'&&!tile.watered){if(!useEnergy(1))return;tile.watered=true;}return;}
+ if(tool.id=='scythe'){if(tile.t=='grass'){if(!useEnergy(1))return;if(Math.random()<0.5){addInv('hay');say('割到了干草');}else say('割了些草，没剩多少');}return;}
+ if(tool.id=='can'){if(tile.t=='water'){say('水壶已灌满');return;}if(tile.t=='soil'&&!tile.watered){if(!useEnergy(1))return;tile.watered=true;}return;}
  if(tool.id=='seed'){const c=CROPS[tool.crop];if(tile.t!='soil'||tile.crop){say('需要空的耕地');return;}
-  if(state.gold<c.seed){say('金币不足');return;}state.gold-=c.seed;tile.crop={id:tool.crop,stage:0};say(`种下${c.name}（-${c.seed}金）`);save();}
-}
-function sleep(){let earned=0;for(const k in state.bin)earned+=CROPS[k].sell*state.bin[k];state.bin={};state.gold+=earned;
+  if(state.gold<c.seed){say('金币不足');return;}state.gold-=c.seed;tile.crop={id:tool.crop,stage:0};say(`种下${ITEMS[tool.crop].name}（-${c.seed}金）`);save();}}
+const NAMES=['小白','豆豆','花卷','团子','麦芽','栗子','布丁','芝麻'];
+function buy(i){if(i==3){if(state.gold<20){say('金币不足');return;}state.gold-=20;addInv('hay');say('买了1份干草');save();return;}
+ const type=i==1?'chicken':i==2?'cow':null;if(!type)return;const A=ANIMALS[type];
+ if(state.animals.length>=8){say('畜栏满了');return;}if(state.gold<A.price){say('金币不足');return;}
+ state.gold-=A.price;const name=NAMES[state.animals.length%8];
+ state.animals.push({type,name,x:PEN.x0+2,y:PEN.y0+2,happy:50,fed:false,petted:false,product:null,tx:PEN.x0+2,ty:PEN.y0+2});
+ say(`买了一只${A.name}「${name}」！`);save();}
+function sleep(){let earned=0;for(const k in state.bin)earned+=ITEMS[k].sell*state.bin[k];state.bin={};state.gold+=earned;
  for(const row of state.tiles)for(const t of row){if(t.crop&&t.watered){const max=CROPS[t.crop.id].stages-1;if(t.crop.stage<max)t.crop.stage++;}
   t.watered=false;if(t.t=='soil'&&!t.crop&&Math.random()<0.05)t.t='grass';}
- state.day++;state.time=0;state.energy=100;state.player={x:3,y:5,dir:'down'};
+ for(const a of state.animals){a.happy=Math.max(0,Math.min(100,a.happy+(a.fed?5:-20)+(a.petted?0:-5)));
+  if(a.fed&&a.happy>=40&&!a.product)a.product=ANIMALS[a.type].product;a.fed=false;a.petted=false;}
+ for(const k in state.rel){state.rel[k].talked=false;state.rel[k].gifted=false;}
+ state.day++;state.time=0;state.energy=100;state.player={x:3,y:5,dir:'down'};mode=null;
  say(`第${state.day}天开始了。`+(earned?`出货收入 +${earned}金`:''));save();}
 const keys={};let moveCD=0,clockAcc=0;
-addEventListener('keydown',e=>{const k=e.key.toLowerCase();keys[k]=true;
- if(k>='1'&&k<='6')state.tool=+k-1;if(k==' '){e.preventDefault();interact(...facing());}
- if(k=='n')sleep();if(k=='r'&&confirm('重置存档？')){state=newState();save();}
- if(k.startsWith('arrow'))e.preventDefault();});
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();if(k==' '||k.startsWith('arrow'))e.preventDefault();
+ if(mode){if(mode=='shop'&&'123'.includes(k)&&k)buy(+k);else if(k=='escape'||k==' '||(k=='h'&&mode=='rel')||(mode=='shop'&&k=='4'))mode=null;return;}
+ keys[k]=true;if(k>='1'&&k<='7')state.tool=+k-1;if(k==' ')interact(...facing());
+ if(k=='q'){const ks=Object.keys(state.inv);if(ks.length)state.sel=ks[(ks.indexOf(state.sel)+1)%ks.length];}
+ if(k=='g')gift();if(k=='h')mode='rel';
+ if(k=='n')sleep();if(k=='r'&&confirm('重置存档？')){state=newState();save();}});
 addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
+let cam={x:0,y:0};
 cv.addEventListener('click',e=>{const r=cv.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
- if(y>H*T){const i=Math.floor((x-10)/60);if(i>=0&&i<TOOLS.length)state.tool=i;return;}
- const tx=Math.floor(x/T),ty=Math.floor(y/T),p=state.player;
+ if(mode){mode=null;return;}
+ if(y>VH*T){const i=Math.floor((x-6)/62);if(y<VH*T+34&&i>=0&&i<TOOLS.length)state.tool=i;return;}
+ const tx=Math.floor((x+cam.x)/T),ty=Math.floor((y+cam.y)/T),p=state.player;
  if(Math.abs(tx-p.x)+Math.abs(ty-p.y)==1){p.dir=tx>p.x?'right':tx<p.x?'left':ty>p.y?'down':'up';interact(tx,ty);}
  else if(tx==p.x&&ty==p.y)interact(...facing());else say('点击角色相邻的格子');});
 function update(dt){moveCD-=dt;msgT-=dt;
+ for(const a of state.animals){if(Math.random()<dt*0.3){a.tx=PEN.x0+Math.random()*(PEN.x1-PEN.x0);a.ty=PEN.y0+Math.random()*(PEN.y1-PEN.y0);}
+  const dx=a.tx-a.x,dy=a.ty-a.y,d=Math.hypot(dx,dy);if(d>0.05){a.x+=dx/d*dt*0.8;a.y+=dy/d*dt*0.8;}}
+ if(mode)return;
  if(moveCD<=0){const m=keys.w||keys.arrowup?'up':keys.s||keys.arrowdown?'down':keys.a||keys.arrowleft?'left':keys.d||keys.arrowright?'right':null;
   if(m){move(m);moveCD=0.13;}}
  clockAcc+=dt;if(clockAcc>=1){clockAcc-=1;state.time+=10;if(state.time>=20*60){say('太晚了，你昏睡过去…');sleep();}}}
 function drawTile(x,y,t){const px=x*T,py=y*T;
  g.fillStyle=((x+y)%2)?'#5fa04a':'#64a84e';g.fillRect(px,py,T,T);
  if(t.t=='grass'&&(x*7+y*13)%5==0){g.fillStyle='#4c8a3a';g.fillRect(px+8,py+12,2,6);g.fillRect(px+20,py+20,2,5);}
+ if(t.t=='path'){g.fillStyle='#cdb88a';g.fillRect(px,py,T,T);g.fillStyle='#b9a273';g.fillRect(px+4,py+6,8,5);g.fillRect(px+18,py+19,9,5);}
+ if(t.t=='fence'){g.fillStyle='#8a6a3a';g.fillRect(px+13,py+4,6,26);g.fillRect(px,py+10,T,4);g.fillRect(px,py+20,T,4);}
  if(t.t=='soil'){g.fillStyle=t.watered?'#5a3b22':'#9a6b40';g.fillRect(px+1,py+1,T-2,T-2);g.fillStyle='rgba(0,0,0,.15)';for(let i=6;i<T;i+=9)g.fillRect(px+3,py+i,T-6,2);}
  if(t.t=='water'){g.fillStyle='#3b7fd0';g.fillRect(px,py,T,T);g.fillStyle='#7fb6ee';g.fillRect(px+5+(Date.now()/300+x)%10,py+10,8,2);}
  if(t.t=='bin'){g.fillStyle='#8a5a2b';g.fillRect(px+3,py+8,T-6,T-10);g.fillStyle='#b07a40';g.fillRect(px+1,py+5,T-2,6);}
+ if(t.t=='shop'){g.fillStyle='#e8d36a';g.fillRect(px+2,py+6,T-4,T-8);g.fillStyle='#c33';for(let i=0;i<4;i++)g.fillRect(px+2+i*8,py+2,4,8);g.fillStyle='#000';g.font='10px sans-serif';g.fillText('商店',px+5,py+24);}
  if(t.crop)drawCrop(px,py,t.crop);}
 function drawCrop(px,py,c){const d=CROPS[c.id],max=d.stages-1,f=c.stage/max;
  g.fillStyle='#2e8b2e';const h=4+f*18;g.fillRect(px+15,py+26-h,3,h);
  if(c.stage>0){g.fillRect(px+9,py+24-h*0.6,6,3);g.fillRect(px+18,py+22-h*0.7,6,3);}
  if(c.stage>=max){g.fillStyle=d.color;g.beginPath();g.arc(px+16,py+8,6,0,7);g.fill();}}
-function drawHouse(){const px=T,py=T;g.fillStyle='#c9a26b';g.fillRect(px,py+28,4*T,3*T-28);
- g.fillStyle='#a33';g.beginPath();g.moveTo(px-6,py+30);g.lineTo(px+2*T,py-6);g.lineTo(px+4*T+6,py+30);g.fill();
- g.fillStyle='#5a3a1a';g.fillRect(px+T*1.6,py+T*2,T*0.8,T);g.fillStyle='#aee';g.fillRect(px+12,py+44,18,14);g.fillRect(px+T*3-6,py+44,18,14);}
-function drawPlayer(){const p=state.player,px=p.x*T,py=p.y*T;g.fillStyle='rgba(0,0,0,.25)';g.fillRect(px+8,py+27,16,4);
- g.fillStyle='#2a5bd7';g.fillRect(px+10,py+14,12,12);g.fillStyle='#f1c9a0';g.fillRect(px+10,py+4,12,10);
- g.fillStyle='#6b3e1e';g.fillRect(px+9,py+2,14,4);g.fillStyle='#000';
- const [dx,dy]=D[p.dir];if(p.dir!='up'){g.fillRect(px+13+dx*2,py+8,2,2);g.fillRect(px+18+dx*2,py+8,2,2);}
- const [fx,fy]=facing();g.strokeStyle='rgba(255,255,255,.6)';g.strokeRect(fx*T+1,fy*T+1,T-2,T-2);}
-function render(){for(let y=0;y<H;y++)for(let x=0;x<W;x++)drawTile(x,y,state.tiles[y][x]);drawHouse();drawPlayer();
- g.fillStyle='#000';g.fillRect(0,H*T,cv.width,64);g.font='12px sans-serif';
- TOOLS.forEach((t,i)=>{const x=10+i*60;g.fillStyle=i==state.tool?'#ffd34d':'#555';g.fillRect(x,H*T+6,56,26);
-  g.fillStyle=i==state.tool?'#000':'#fff';g.fillText((i+1)+' '+t.name.replace('种子','籽'),x+3,H*T+23);});
- const inv=Object.keys(state.inv).map(k=>CROPS[k].name+'×'+state.inv[k]).join(' ')||'空';
+function drawBuilding(x,y,w,h,wall,roof,label){const px=x*T,py=y*T;g.fillStyle=wall;g.fillRect(px,py+28,w*T,h*T-28);
+ g.fillStyle=roof;g.beginPath();g.moveTo(px-6,py+30);g.lineTo(px+w*T/2,py-6);g.lineTo(px+w*T+6,py+30);g.fill();
+ g.fillStyle='#5a3a1a';g.fillRect(px+w*T/2-12,py+h*T-T,24,T);if(label){g.fillStyle='#fff';g.font='11px sans-serif';g.fillText(label,px+6,py+44);}}
+function drawAnimal(a){const px=a.x*T,py=a.y*T;
+ if(a.type=='chicken'){g.fillStyle='#fff';g.beginPath();g.ellipse(px+16,py+20,8,7,0,0,7);g.fill();g.fillStyle='#e33';g.fillRect(px+20,py+9,4,3);g.fillStyle='#fff';g.fillRect(px+18,py+11,7,7);g.fillStyle='#f90';g.fillRect(px+25,py+14,3,2);}
+ else{g.fillStyle='#f4f0e8';g.fillRect(px+4,py+12,22,13);g.fillStyle='#333';g.fillRect(px+8,py+14,6,5);g.fillRect(px+18,py+19,5,4);g.fillStyle='#f4f0e8';g.fillRect(px+24,py+8,8,10);g.fillStyle='#e9a';g.fillRect(px+26,py+15,6,3);g.fillStyle='#555';g.fillRect(px+6,py+25,3,5);g.fillRect(px+21,py+25,3,5);}
+ if(a.product){g.fillStyle=a.product=='egg'?'#fff8e0':'#fff';g.strokeStyle='#000';g.beginPath();g.arc(px+16,py,5,0,7);g.fill();g.stroke();}
+ else if(!a.fed){g.fillStyle='#fc3';g.font='10px sans-serif';g.fillText('饿',px+12,py+4);}}
+function drawPerson(px,py,body,hair,dir){g.fillStyle='rgba(0,0,0,.25)';g.fillRect(px+8,py+27,16,4);
+ g.fillStyle=body;g.fillRect(px+10,py+14,12,12);g.fillStyle='#f1c9a0';g.fillRect(px+10,py+4,12,10);
+ g.fillStyle=hair;g.fillRect(px+9,py+2,14,4);g.fillStyle='#000';if(dir!='up'){const dx=D[dir][0];g.fillRect(px+13+dx*2,py+8,2,2);g.fillRect(px+18+dx*2,py+8,2,2);}}
+function render(){const p=state.player;cam.x=Math.max(0,Math.min(W*T-VW*T,p.x*T-VW*T/2+16));cam.y=Math.max(0,Math.min(H*T-VH*T,p.y*T-VH*T/2+16));
+ g.save();g.beginPath();g.rect(0,0,VW*T,VH*T);g.clip();g.translate(-cam.x,-cam.y);
+ for(let y=0;y<H;y++)for(let x=0;x<W;x++)drawTile(x,y,state.tiles[y][x]);
+ drawBuilding(1,1,4,3,'#c9a26b','#a33');drawBuilding(9,1,4,3,'#d9c08a','#7a4a2a','鸡舍/喂食');
+ drawBuilding(22,1,3,3,'#b8c8d8','#3a6a9a');drawBuilding(27,1,4,3,'#a89880','#444','铁匠铺');drawBuilding(27,17,3,3,'#e0d0c0','#7a5a9a');
+ state.animals.forEach(drawAnimal);
+ VILLAGERS.forEach(v=>{const [x,y]=villagerPos(v);drawPerson(x*T,y*T,v.body,v.hair,'down');g.fillStyle='#fff';g.font='10px sans-serif';g.fillText(v.name,x*T,y*T-2);});
+ drawPerson(p.x*T,p.y*T,'#2a5bd7','#6b3e1e',p.dir);
+ const [fx,fy]=facing();g.strokeStyle='rgba(255,255,255,.6)';g.strokeRect(fx*T+1,fy*T+1,T-2,T-2);
+ const dark=Math.max(0,(state.time-12*60)/(8*60))*0.45;g.restore();
+ if(dark>0){g.fillStyle=`rgba(10,10,60,${dark})`;g.fillRect(0,0,VW*T,VH*T);}
+ g.fillStyle='#000';g.fillRect(0,VH*T,cv.width,64);g.font='12px sans-serif';
+ TOOLS.forEach((t,i)=>{const x=6+i*62;g.fillStyle=i==state.tool?'#ffd34d':'#555';g.fillRect(x,VH*T+6,58,26);
+  g.fillStyle=i==state.tool?'#000':'#fff';g.fillText((i+1)+' '+t.name,x+3,VH*T+23);});
+ const inv=Object.keys(state.inv).map(k=>(k==state.sel?'【':'')+ITEMS[k].name+'×'+state.inv[k]+(k==state.sel?'】':'')).join(' ')||'空';
  const bin=Object.values(state.bin).reduce((a,b)=>a+b,0);
- g.fillStyle='#fff';g.fillText('背包: '+inv+'   出货箱: '+bin+'件',10,H*T+52);
+ g.fillStyle='#fff';g.fillText('背包: '+inv+'   出货箱: '+bin+'件',8,VH*T+52);
  const hr=6+Math.floor(state.time/60),mn=state.time%60;
  g.fillStyle='rgba(0,0,0,.6)';g.fillRect(cv.width-170,4,166,62);g.fillStyle='#fff';g.font='14px sans-serif';
  g.fillText(`第 ${state.day} 天  ${String(hr%24).padStart(2,'0')}:${String(mn).padStart(2,'0')}`,cv.width-162,22);
  g.fillText(`金币: ${state.gold}`,cv.width-162,40);g.fillText('体力',cv.width-162,58);
  g.fillStyle='#333';g.fillRect(cv.width-125,48,112,10);g.fillStyle=state.energy>30?'#4c4':'#d44';g.fillRect(cv.width-125,48,112*state.energy/100,10);
- const dark=Math.max(0,(state.time-12*60)/(8*60))*0.45;if(dark>0){g.fillStyle=`rgba(10,10,60,${dark})`;g.fillRect(0,0,cv.width,H*T);}
- if(msgT>0){g.font='15px sans-serif';const w=g.measureText(msg).width+20;g.fillStyle='rgba(0,0,0,.7)';g.fillRect(10,10,w,26);g.fillStyle='#fff';g.fillText(msg,20,28);}}
+ if(msgT>0){g.font='15px sans-serif';const w=g.measureText(msg).width+20;g.fillStyle='rgba(0,0,0,.7)';g.fillRect(10,10,w,26);g.fillStyle='#fff';g.fillText(msg,20,28);}
+ if(mode)panel();}
+function box(x,y,w,h){g.fillStyle='rgba(30,20,10,.92)';g.fillRect(x,y,w,h);g.strokeStyle='#e8c070';g.lineWidth=2;g.strokeRect(x,y,w,h);g.lineWidth=1;g.fillStyle='#fff';}
+function panel(){g.font='15px sans-serif';
+ if(mode=='talk'){box(20,VH*T-110,600,96);g.fillStyle='#ffd34d';g.fillText(talk.name,36,VH*T-84);g.fillStyle='#fff';g.fillText(talk.text,36,VH*T-56);g.font='11px sans-serif';g.fillText('空格继续',560,VH*T-22);}
+ if(mode=='shop'){box(160,110,320,180);g.fillText('动物商店   金币: '+state.gold,180,140);g.fillText('1  鸡     300金（每天产蛋）',180,175);
+  g.fillText('2  奶牛   800金（每天产奶）',180,205);g.fillText('3  干草    20金',180,235);g.font='12px sans-serif';g.fillText('按 1-3 购买，Esc/空格/4 关闭   动物:'+state.animals.length+'/8',180,270);}
+ if(mode=='rel'){box(110,60,420,60+VILLAGERS.length*50);g.fillText('人际关系（H 关闭）',130,90);
+  VILLAGERS.forEach((v,i)=>{const r=state.rel[v.id],h=Math.floor(r.pts/250),y=125+i*50;g.fillStyle='#fff';g.fillText(v.name,130,y);
+   for(let j=0;j<10;j++){g.fillStyle=j<h?'#e33':'#555';g.fillText('♥',220+j*22,y);}
+   g.fillStyle='#bbb';g.font='11px sans-serif';g.fillText(`${r.pts}/2500  今日:${r.talked?'已聊':'未聊'} ${r.gifted?'已送礼':'可送礼'}  最爱:${v.loved.map(k=>ITEMS[k].name).join('、')}`,220,y+18);g.font='15px sans-serif';});}}
 let last=performance.now();function loop(n){const dt=Math.min(.1,(n-last)/1000);last=n;update(dt);render();requestAnimationFrame(loop);}
-setInterval(save,10000);window.__game={get state(){return state},interact,sleep,move};requestAnimationFrame(loop);
+setInterval(save,10000);window.__game={get state(){return state},interact,sleep,move,buy,gift,facing,villagerPos,VILLAGERS,migrate,addInv};requestAnimationFrame(loop);
 </script></body></html>
